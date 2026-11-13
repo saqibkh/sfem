@@ -1,0 +1,100 @@
+name: CUDA tests (simulated H100)
+
+# Optional, non-required check. The hosted runners have no GPU, so the main
+# workflow builds with SFEM_ENABLE_CUDA=OFF. This one builds libsfem with CUDA
+# and runs the CUDA unit tests (src/frontend/tests/cuda) on a simulated NVIDIA
+# H100 (https://github.com/pantheongpu/pantheonsim). A simulator cannot
+# reproduce hardware-specific behavior or timing, so it complements real-GPU
+# testing and does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "external/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-sim:
+    name: CUDA 12.6 on a simulated H100
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize submodules
+        run: |
+          git submodule update --init external/smesh external/sresample
+          git -C external/smesh submodule update --init --recursive
+          git -C external/sresample submodule update --init --recursive
+
+      - name: Download Matrix.IO
+        run: git clone --depth 1 https://bitbucket.org/zulianp/matrix.io.git "$RUNNER_TEMP/matrix.io"
+
+      # CUDA 12.6 rather than 13.0: sfem_MPRGPKernels_cuda.cu calls the
+      # five-argument cudaGraphAddNode, which CUDA 13 replaced.
+      # library-path 'false': the tests link the toolkit's cuBLAS and cuSPARSE.
+      - name: Set up the simulated H100 and the CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@ab71a07326835be678918901c340d53a83358067 # v0.1.6
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "12.6"
+          library-path: 'false'
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mpi-default-dev ninja-build ccache cuda-nvtx-12-6
+
+      - name: Restore ccache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ccache
+          key: ccache-gpu-sim-${{ github.sha }}
+          restore-keys: |
+            ccache-gpu-sim-
+
+      # 90-virtual: PTX only, which the simulator runs. libsfem links the
+      # shared CUDA::cudart, which the simulator needs.
+      - name: Configure
+        run: |
+          cmake -S . -B build -GNinja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.6/bin/nvcc \
+                -DCUDAToolkit_ROOT=/usr/local/cuda-12.6 \
+                -DCMAKE_CUDA_ARCHITECTURES=90-virtual \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+                -DSFEM_ENABLE_CUDA=ON \
+                -DSFEM_ENABLE_RESAMPLING=OFF \
+                -DSFEM_ENABLE_PYTHON=OFF \
+                -DMatrixIO_DIR="$RUNNER_TEMP/matrix.io"
+
+      # Only libsfem and the CUDA tests: the drivers and the CPU tests are
+      # built and run by the main workflow.
+      - name: Build the CUDA tests
+        run: |
+          export CCACHE_MAXSIZE=2G
+          ccache -z
+          tests=$(sed -n 's/^build \(sfem_Cuda[A-Za-z]*Test\): .*/\1/p' build/build.ninja | sort -u)
+          echo "$tests"
+          cmake --build build -j3 --target $tests
+          ccache -s
+
+      - name: Run the CUDA tests
+        working-directory: build
+        run: vgpu run ctest -R '^sfem_Cuda' --output-on-failure --timeout 1800
